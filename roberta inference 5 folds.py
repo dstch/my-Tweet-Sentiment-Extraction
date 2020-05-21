@@ -1,300 +1,186 @@
-import numpy as np
-import pandas as pd
-import os
+import pandas as pd, numpy as np
+import tensorflow as tf
+import tensorflow.keras.backend as K
+from sklearn.model_selection import StratifiedKFold
+from transformers import *
 import tokenizers
-import string
-import torch
-import transformers
-import torch.nn as nn
-from torch.nn import functional as F
-from tqdm import tqdm
-import re
 
-MAX_LEN = 192
-TRAIN_BATCH_SIZE = 32
-VALID_BATCH_SIZE = 8
-EPOCHS = 5
-ROBERTA_PATH = "../input/roberta-base"
-TOKENIZER = tokenizers.ByteLevelBPETokenizer(
-    vocab_file=f"{ROBERTA_PATH}/vocab.json",
-    merges_file=f"{ROBERTA_PATH}/merges.txt",
+# fork from https://www.kaggle.com/cdeotte/tensorflow-roberta-0-705/data?scriptVersionId=31965447
+
+print('TF version', tf.__version__)
+
+MAX_LEN = 96
+PATH = '../input/tf-roberta/'
+tokenizer = tokenizers.ByteLevelBPETokenizer(
+    vocab_file=PATH + 'vocab-roberta-base.json',
+    merges_file=PATH + 'merges-roberta-base.txt',
     lowercase=True,
     add_prefix_space=True
 )
+sentiment_id = {'positive': 1313, 'negative': 2430, 'neutral': 7974}
+train = pd.read_csv('../input/tweet-sentiment-extraction/train.csv').fillna('')
+train.head()
+
+ct = train.shape[0]
+input_ids = np.ones((ct, MAX_LEN), dtype='int32')
+attention_mask = np.zeros((ct, MAX_LEN), dtype='int32')
+token_type_ids = np.zeros((ct, MAX_LEN), dtype='int32')
+start_tokens = np.zeros((ct, MAX_LEN), dtype='int32')
+end_tokens = np.zeros((ct, MAX_LEN), dtype='int32')
+
+for k in range(train.shape[0]):
+
+    # FIND OVERLAP
+    text1 = " " + " ".join(train.loc[k, 'text'].split())
+    text2 = " ".join(train.loc[k, 'selected_text'].split())
+    idx = text1.find(text2)
+    chars = np.zeros((len(text1)))
+    chars[idx:idx + len(text2)] = 1
+    if text1[idx - 1] == ' ': chars[idx - 1] = 1
+    enc = tokenizer.encode(text1)
+
+    # ID_OFFSETS
+    offsets = [];
+    idx = 0
+    for t in enc.ids:
+        w = tokenizer.decode([t])
+        offsets.append((idx, idx + len(w)))
+        idx += len(w)
+
+    # START END TOKENS
+    toks = []
+    for i, (a, b) in enumerate(offsets):
+        sm = np.sum(chars[a:b])
+        if sm > 0: toks.append(i)
+
+    s_tok = sentiment_id[train.loc[k, 'sentiment']]
+    input_ids[k, :len(enc.ids) + 5] = [0] + enc.ids + [2, 2] + [s_tok] + [2]
+    attention_mask[k, :len(enc.ids) + 5] = 1
+    if len(toks) > 0:
+        start_tokens[k, toks[0] + 1] = 1
+        end_tokens[k, toks[-1] + 1] = 1
+
+test = pd.read_csv('../input/tweet-sentiment-extraction/test.csv').fillna('')
+
+ct = test.shape[0]
+input_ids_t = np.ones((ct, MAX_LEN), dtype='int32')
+attention_mask_t = np.zeros((ct, MAX_LEN), dtype='int32')
+token_type_ids_t = np.zeros((ct, MAX_LEN), dtype='int32')
+
+for k in range(test.shape[0]):
+    # INPUT_IDS
+    text1 = " " + " ".join(test.loc[k, 'text'].split())
+    enc = tokenizer.encode(text1)
+    s_tok = sentiment_id[test.loc[k, 'sentiment']]
+    input_ids_t[k, :len(enc.ids) + 5] = [0] + enc.ids + [2, 2] + [s_tok] + [2]
+    attention_mask_t[k, :len(enc.ids) + 5] = 1
 
 
-class TweetModel(transformers.BertPreTrainedModel):
-    def __init__(self, conf):
-        super(TweetModel, self).__init__(conf)
-        self.roberta = transformers.RobertaModel.from_pretrained(ROBERTA_PATH, config=conf)
-        self.drop_out = nn.Dropout(0.1)
-        self.l0 = nn.Linear(768 * 2, 2)
-        torch.nn.init.normal_(self.l0.weight, std=0.02)
+def build_model():
+    ids = tf.keras.layers.Input((MAX_LEN,), dtype=tf.int32)
+    att = tf.keras.layers.Input((MAX_LEN,), dtype=tf.int32)
+    tok = tf.keras.layers.Input((MAX_LEN,), dtype=tf.int32)
 
-    def forward(self, ids, mask, token_type_ids):
-        _, _, out = self.roberta(
-            ids,
-            attention_mask=mask,
-            token_type_ids=token_type_ids
-        )
+    config = RobertaConfig.from_pretrained(PATH + 'config-roberta-base.json')
+    bert_model = TFRobertaModel.from_pretrained(PATH + 'pretrained-roberta-base.h5', config=config)
+    x = bert_model(ids, attention_mask=att, token_type_ids=tok)
 
-        out = torch.cat((out[-1], out[-2]), dim=-1)
-        out = self.drop_out(out)
-        logits = self.l0(out)
+    x1 = tf.keras.layers.Dropout(0.1)(x[0])
+    x1 = tf.keras.layers.Conv1D(1, 1)(x1)
+    x1 = tf.keras.layers.Flatten()(x1)
+    x1 = tf.keras.layers.Activation('softmax')(x1)
 
-        start_logits, end_logits = logits.split(1, dim=-1)
+    x2 = tf.keras.layers.Dropout(0.1)(x[0])
+    x2 = tf.keras.layers.Conv1D(1, 1)(x2)
+    x2 = tf.keras.layers.Flatten()(x2)
+    x2 = tf.keras.layers.Activation('softmax')(x2)
 
-        start_logits = start_logits.squeeze(-1)
-        end_logits = end_logits.squeeze(-1)
+    model = tf.keras.models.Model(inputs=[ids, att, tok], outputs=[x1, x2])
+    optimizer = tf.keras.optimizers.Adam(learning_rate=3e-5)
+    model.compile(loss='categorical_crossentropy', optimizer=optimizer)
 
-        return start_logits, end_logits
-
-
-def process_data(tweet, selected_text, sentiment, tokenizer, max_len):
-    tweet = " " + " ".join(str(tweet).split())
-    selected_text = " " + " ".join(str(selected_text).split())
-
-    len_st = len(selected_text) - 1
-    idx0 = None
-    idx1 = None
-
-    for ind in (i for i, e in enumerate(tweet) if e == selected_text[1]):
-        if " " + tweet[ind: ind + len_st] == selected_text:
-            idx0 = ind
-            idx1 = ind + len_st - 1
-            break
-
-    char_targets = [0] * len(tweet)
-    if idx0 != None and idx1 != None:
-        for ct in range(idx0, idx1 + 1):
-            char_targets[ct] = 1
-
-    tok_tweet = tokenizer.encode(tweet)
-    input_ids_orig = tok_tweet.ids
-    tweet_offsets = tok_tweet.offsets
-
-    target_idx = []
-    for j, (offset1, offset2) in enumerate(tweet_offsets):
-        if sum(char_targets[offset1: offset2]) > 0:
-            target_idx.append(j)
-
-    targets_start = target_idx[0]
-    targets_end = target_idx[-1]
-
-    sentiment_id = {
-        'positive': 1313,
-        'negative': 2430,
-        'neutral': 7974
-    }
-
-    input_ids = [0] + [sentiment_id[sentiment]] + [2] + [2] + input_ids_orig + [2]
-    token_type_ids = [0, 0, 0, 0] + [0] * (len(input_ids_orig) + 1)
-    mask = [1] * len(token_type_ids)
-    tweet_offsets = [(0, 0)] * 4 + tweet_offsets + [(0, 0)]
-    targets_start += 4
-    targets_end += 4
-
-    padding_length = max_len - len(input_ids)
-    if padding_length > 0:
-        input_ids = input_ids + ([1] * padding_length)
-        mask = mask + ([0] * padding_length)
-        token_type_ids = token_type_ids + ([0] * padding_length)
-        tweet_offsets = tweet_offsets + ([(0, 0)] * padding_length)
-
-    return {
-        'ids': input_ids,
-        'mask': mask,
-        'token_type_ids': token_type_ids,
-        'targets_start': targets_start,
-        'targets_end': targets_end,
-        'orig_tweet': tweet,
-        'orig_selected': selected_text,
-        'sentiment': sentiment,
-        'offsets': tweet_offsets
-    }
+    return model
 
 
-class TweetDataset:
-    def __init__(self, tweet, sentiment, selected_text):
-        self.tweet = tweet
-        self.sentiment = sentiment
-        self.selected_text = selected_text
-        self.tokenizer = TOKENIZER
-        self.max_len = MAX_LEN
-
-    def __len__(self):
-        return len(self.tweet)
-
-    def __getitem__(self, item):
-        data = process_data(
-            self.tweet[item],
-            self.selected_text[item],
-            self.sentiment[item],
-            self.tokenizer,
-            self.max_len
-        )
-
-        return {
-            'ids': torch.tensor(data["ids"], dtype=torch.long),
-            'mask': torch.tensor(data["mask"], dtype=torch.long),
-            'token_type_ids': torch.tensor(data["token_type_ids"], dtype=torch.long),
-            'targets_start': torch.tensor(data["targets_start"], dtype=torch.long),
-            'targets_end': torch.tensor(data["targets_end"], dtype=torch.long),
-            'orig_tweet': data["orig_tweet"],
-            'orig_selected': data["orig_selected"],
-            'sentiment': data["sentiment"],
-            'offsets': torch.tensor(data["offsets"], dtype=torch.long)
-        }
+def jaccard(str1, str2):
+    a = set(str1.lower().split())
+    b = set(str2.lower().split())
+    if (len(a) == 0) & (len(b) == 0): return 0.5
+    c = a.intersection(b)
+    return float(len(c)) / (len(a) + len(b) - len(c))
 
 
-def calculate_jaccard_score(
-        original_tweet,
-        target_string,
-        sentiment_val,
-        idx_start,
-        idx_end,
-        offsets,
-        verbose=False):
-    if idx_end < idx_start:
-        idx_end = idx_start
+jac = [];
+VER = 'v0';
+DISPLAY = 1  # USE display=1 FOR INTERACTIVE
+oof_start = np.zeros((input_ids.shape[0], MAX_LEN))
+oof_end = np.zeros((input_ids.shape[0], MAX_LEN))
+preds_start = np.zeros((input_ids_t.shape[0], MAX_LEN))
+preds_end = np.zeros((input_ids_t.shape[0], MAX_LEN))
 
-    filtered_output = ""
-    for ix in range(idx_start, idx_end + 1):
-        filtered_output += original_tweet[offsets[ix][0]: offsets[ix][1]]
-        if (ix + 1) < len(offsets) and offsets[ix][1] < offsets[ix + 1][0]:
-            filtered_output += " "
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=777)
+for fold, (idxT, idxV) in enumerate(skf.split(input_ids, train.sentiment.values)):
 
-    if sentiment_val == "neutral" or len(original_tweet.split()) < 2:
-        filtered_output = original_tweet
+    print('#' * 25)
+    print('### FOLD %i' % (fold + 1))
+    print('#' * 25)
 
-    if sentiment_val != "neutral" and verbose == True:
-        if filtered_output.strip().lower() != target_string.strip().lower():
-            print("********************************")
-            print(f"Output= {filtered_output.strip()}")
-            print(f"Target= {target_string.strip()}")
-            print(f"Tweet= {original_tweet.strip()}")
-            print("********************************")
+    K.clear_session()
+    model = build_model()
 
-    jac = 0
-    return jac, filtered_output
+    sv = tf.keras.callbacks.ModelCheckpoint(
+        '%s-roberta-%i.h5' % (VER, fold), monitor='val_loss', verbose=1, save_best_only=True,
+        save_weights_only=True, mode='auto', save_freq='epoch')
 
+    model.fit([input_ids[idxT,], attention_mask[idxT,], token_type_ids[idxT,]],
+              [start_tokens[idxT,], end_tokens[idxT,]],
+              epochs=3, batch_size=32, verbose=DISPLAY, callbacks=[sv],
+              validation_data=([input_ids[idxV,], attention_mask[idxV,], token_type_ids[idxV,]],
+                               [start_tokens[idxV,], end_tokens[idxV,]]))
 
-df_test = pd.read_csv("../input/tweet-sentiment-extraction/test.csv")
-df_test.loc[:, "selected_text"] = df_test.text.values
+    print('Loading model...')
+    model.load_weights('%s-roberta-%i.h5' % (VER, fold))
 
-device = torch.device("cuda")
-model_config = transformers.RobertaConfig.from_pretrained(ROBERTA_PATH)
-model_config.output_hidden_states = True
+    print('Predicting OOF...')
+    oof_start[idxV,], oof_end[idxV,] = model.predict([input_ids[idxV,], attention_mask[idxV,], token_type_ids[idxV,]],
+                                                     verbose=DISPLAY)
 
-model1 = TweetModel(conf=model_config)
-model1.to(device)
-model1.load_state_dict(torch.load("../input/tweet-roberta/model_0.bin"))
-model1.eval()
+    print('Predicting Test...')
+    preds = model.predict([input_ids_t, attention_mask_t, token_type_ids_t], verbose=DISPLAY)
+    preds_start += preds[0] / skf.n_splits
+    preds_end += preds[1] / skf.n_splits
 
-model2 = TweetModel(conf=model_config)
-model2.to(device)
-model2.load_state_dict(torch.load("../input/tweet-roberta/model_1.bin"))
-model2.eval()
+    # DISPLAY FOLD JACCARD
+    all = []
+    for k in idxV:
+        a = np.argmax(oof_start[k,])
+        b = np.argmax(oof_end[k,])
+        if a > b:
+            st = train.loc[k, 'text']  # IMPROVE CV/LB with better choice here
+        else:
+            text1 = " " + " ".join(train.loc[k, 'text'].split())
+            enc = tokenizer.encode(text1)
+            st = tokenizer.decode(enc.ids[a - 1:b])
+        all.append(jaccard(st, train.loc[k, 'selected_text']))
+    jac.append(np.mean(all))
+    print('>>>> FOLD %i Jaccard =' % (fold + 1), np.mean(all))
+    print()
 
-model3 = TweetModel(conf=model_config)
-model3.to(device)
-model3.load_state_dict(torch.load("../input/tweet-roberta/model_2.bin"))
-model3.eval()
+print('>>>> OVERALL 5Fold CV Jaccard =', np.mean(jac))
 
-model4 = TweetModel(conf=model_config)
-model4.to(device)
-model4.load_state_dict(torch.load("../input/tweet-roberta/model_3.bin"))
-model4.eval()
+all = []
+for k in range(input_ids_t.shape[0]):
+    a = np.argmax(preds_start[k,])
+    b = np.argmax(preds_end[k,])
+    if a > b:
+        st = test.loc[k, 'text']
+    else:
+        text1 = " " + " ".join(test.loc[k, 'text'].split())
+        enc = tokenizer.encode(text1)
+        st = tokenizer.decode(enc.ids[a - 1:b])
+    all.append(st)
 
-model5 = TweetModel(conf=model_config)
-model5.to(device)
-model5.load_state_dict(torch.load("../input/tweet-roberta/model_4.bin"))
-model5.eval()
-
-final_output = []
-
-test_dataset = TweetDataset(
-    tweet=df_test.text.values,
-    sentiment=df_test.sentiment.values,
-    selected_text=df_test.selected_text.values
-)
-
-data_loader = torch.utils.data.DataLoader(
-    test_dataset,
-    shuffle=False,
-    batch_size=VALID_BATCH_SIZE,
-    num_workers=1
-)
-
-with torch.no_grad():
-    tk0 = tqdm(data_loader, total=len(data_loader))
-    for bi, d in enumerate(tk0):
-        ids = d["ids"]
-        token_type_ids = d["token_type_ids"]
-        mask = d["mask"]
-        sentiment = d["sentiment"]
-        orig_selected = d["orig_selected"]
-        orig_tweet = d["orig_tweet"]
-        targets_start = d["targets_start"]
-        targets_end = d["targets_end"]
-        offsets = d["offsets"].numpy()
-
-        ids = ids.to(device, dtype=torch.long)
-        token_type_ids = token_type_ids.to(device, dtype=torch.long)
-        mask = mask.to(device, dtype=torch.long)
-        targets_start = targets_start.to(device, dtype=torch.long)
-        targets_end = targets_end.to(device, dtype=torch.long)
-
-        outputs_start1, outputs_end1 = model1(
-            ids=ids,
-            mask=mask,
-            token_type_ids=token_type_ids
-        )
-
-        outputs_start2, outputs_end2 = model2(
-            ids=ids,
-            mask=mask,
-            token_type_ids=token_type_ids
-        )
-
-        outputs_start3, outputs_end3 = model3(
-            ids=ids,
-            mask=mask,
-            token_type_ids=token_type_ids
-        )
-
-        outputs_start4, outputs_end4 = model4(
-            ids=ids,
-            mask=mask,
-            token_type_ids=token_type_ids
-        )
-
-        outputs_start5, outputs_end5 = model5(
-            ids=ids,
-            mask=mask,
-            token_type_ids=token_type_ids
-        )
-        outputs_start = (outputs_start1 + outputs_start2 + outputs_start3 + outputs_start4 + outputs_start5) / 5
-        outputs_end = (outputs_end1 + outputs_end2 + outputs_end3 + outputs_end4 + outputs_end5) / 5
-
-        outputs_start = torch.softmax(outputs_start, dim=1).cpu().detach().numpy()
-        outputs_end = torch.softmax(outputs_end, dim=1).cpu().detach().numpy()
-        jaccard_scores = []
-        for px, tweet in enumerate(orig_tweet):
-            selected_tweet = orig_selected[px]
-            tweet_sentiment = sentiment[px]
-            _, output_sentence = calculate_jaccard_score(
-                original_tweet=tweet,
-                target_string=selected_tweet,
-                sentiment_val=tweet_sentiment,
-                idx_start=np.argmax(outputs_start[px, :]),
-                idx_end=np.argmax(outputs_end[px, :]),
-                offsets=offsets[px]
-            )
-            final_output.append(output_sentence)
-
-sample = pd.read_csv("../input/tweet-sentiment-extraction/sample_submission.csv")
-sample.loc[:, 'selected_text'] = final_output
-sample.to_csv("submission.csv", index=False)
-
-sample.head()
+test['selected_text'] = all
+test[['textID', 'selected_text']].to_csv('submission.csv', index=False)
+pd.set_option('max_colwidth', 60)
+test.sample(25)
