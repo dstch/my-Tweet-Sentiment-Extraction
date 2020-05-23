@@ -2,3 +2,10 @@
 1、寻找新的css，并研究在组件内的css不起作用的原因 http://theme.typora.io/
 2、自己建立新的angular项目，同时研究权限管理并寻找模板
 3、研究flask login 查找模板：https://github.com/wangy8961/flask-vuejs-madblog
+
+
+flask用户认证设计：蓝图、ORM、RBAC
+https://www.jianshu.com/p/42ac2328820e
+
+angular：ngx-admin
+https://github.com/NG-NEST/ng-nest-moon
